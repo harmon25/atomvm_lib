@@ -66,7 +66,8 @@
 -record(state, {
     config,
     pending_request_map = #{},
-    ws_socket_map = #{}
+    ws_socket_map = #{},
+    pending_buffer_map = #{}
 }).
 
 %%
@@ -122,59 +123,78 @@ handle_receive(Socket, Packet, State) ->
 
 %% @private
 handle_http_request(Socket, Packet, State) ->
-    case maps:get(Socket, State#state.pending_request_map, undefined) of
+    PendingRequestMap = State#state.pending_request_map,
+    BufferMap = State#state.pending_buffer_map,
+    PendingBuffer = maps:get(Socket, BufferMap, <<>>),
+    AccumulatedPacket = <<PendingBuffer/binary, Packet/binary>>,
+    case maps:get(Socket, PendingRequestMap, undefined) of
         undefined ->
-            HttpRequest = parse_http_request(binary_to_list(Packet)),
-            % ?TRACE("HttpRequest: ~p~n", [HttpRequest]),
-            #{
-                method := Method,
-                headers := Headers
-            } = HttpRequest,
-            case get_protocol(Method, Headers) of
-                http ->
-                    case init_handler(HttpRequest, State) of
-                        {ok, {Handler, HandlerState, PathSuffix, HandlerConfig}} ->
-                            NewHttpRequest = HttpRequest#{
-                                handler => Handler,
-                                handler_state => HandlerState,
-                                path_suffix => PathSuffix,
-                                handler_config => HandlerConfig,
-                                socket => Socket
-                            },
-                            handle_request_state(Socket, NewHttpRequest, State);
-                        Error ->
-                            {close, create_error(?INTERNAL_SERVER_ERROR, Error)}
-                    end;
-                ws ->
-                    ?TRACE("Protocol is ws", []),
-                    Config = State#state.config,
-                    Path = maps:get(path, HttpRequest),
-                    case get_handler(Path, Config) of
-                        {ok, PathSuffix, EntryConfig} ->
-                            WsHandler = maps:get(handler, EntryConfig),
-                            ?TRACE("Got handler ~p", [WsHandler]),
-                            HandlerConfig = maps:get(handler_config, EntryConfig, #{}),
-                            case WsHandler:start(Socket, PathSuffix, HandlerConfig) of
-                                {ok, WebSocket} ->
-                                    ?TRACE("Started web socket handler: ~p", [WebSocket]),
-                                    NewWebSocketMap = maps:put(Socket, WebSocket, State#state.ws_socket_map),
-                                    NewState = State#state{ws_socket_map = NewWebSocketMap},
-                                    ReplyToken = get_reply_token(maps:get(headers, HttpRequest)),
-                                    ReplyHeaders = #{"Upgrade" => "websocket", "Connection" => "Upgrade", "Sec-WebSocket-Accept" => ReplyToken},
-                                    Reply = create_reply(?SWITCHING_PROTOCOLS, ReplyHeaders, <<"">>),
-                                    ?TRACE("Sending web socket upgrade reply: ~p", [Reply]),
-                                    {reply, Reply, NewState};
+            case maybe_parse_http_request(AccumulatedPacket) of
+                {more, IncompletePacket} ->
+                    NewBufferMap = BufferMap#{Socket => IncompletePacket},
+                    {noreply, State#state{pending_buffer_map = NewBufferMap}};
+                {ok, HttpRequest} ->
+                    CleanBufferMap = maps:remove(Socket, BufferMap),
+                    CleanState = State#state{pending_buffer_map = CleanBufferMap},
+                    % ?TRACE("HttpRequest: ~p~n", [HttpRequest]),
+                    #{
+                        method := Method,
+                        headers := Headers
+                    } = HttpRequest,
+                    case get_protocol(Method, Headers) of
+                        http ->
+                            case init_handler(HttpRequest, CleanState) of
+                                {ok, {Handler, HandlerState, PathSuffix, HandlerConfig}} ->
+                                    NewHttpRequest = HttpRequest#{
+                                        handler => Handler,
+                                        handler_state => HandlerState,
+                                        path_suffix => PathSuffix,
+                                        handler_config => HandlerConfig,
+                                        socket => Socket
+                                    },
+                                    handle_request_state(Socket, NewHttpRequest, CleanState);
                                 Error ->
-                                    ?TRACE("Web socket error: ~p", [Error]),
-                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                                    {close, create_error(?INTERNAL_SERVER_ERROR, Error)}
                             end;
-                        Error ->
-                            Error
-                    end
+                        ws ->
+                            ?TRACE("Protocol is ws", []),
+                            Config = CleanState#state.config,
+                            Path = maps:get(path, HttpRequest),
+                            case get_handler(Path, Config) of
+                                {ok, PathSuffix, EntryConfig} ->
+                                    WsHandler = maps:get(handler, EntryConfig),
+                                    ?TRACE("Got handler ~p", [WsHandler]),
+                                    HandlerConfig = maps:get(handler_config, EntryConfig, #{}),
+                                    case WsHandler:start(Socket, PathSuffix, HandlerConfig) of
+                                        {ok, WebSocket} ->
+                                            ?TRACE("Started web socket handler: ~p", [WebSocket]),
+                                            NewWebSocketMap = maps:put(Socket, WebSocket, CleanState#state.ws_socket_map),
+                                            NewState = CleanState#state{ws_socket_map = NewWebSocketMap},
+                                            ReplyToken = get_reply_token(maps:get(headers, HttpRequest)),
+                                            ReplyHeaders = #{"Upgrade" => "websocket", "Connection" => "Upgrade", "Sec-WebSocket-Accept" => ReplyToken},
+                                            Reply = create_reply(?SWITCHING_PROTOCOLS, ReplyHeaders, <<"">>),
+                                            ?TRACE("Sending web socket upgrade reply: ~p", [Reply]),
+                                            {reply, Reply, NewState};
+                                        Error ->
+                                            ?TRACE("Web socket error: ~p", [Error]),
+                                            {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                                    end;
+                                Error ->
+                                    Error
+                            end
+                    end;
+                {error, Reason} ->
+                    CleanBufferMap = maps:remove(Socket, BufferMap),
+                    _CleanState = State#state{pending_buffer_map = CleanBufferMap},
+                    {close, create_error(?BAD_REQUEST, Reason)}
             end;
         PendingHttpRequest ->
             ?TRACE("Packetlen: ~p", [erlang:byte_size(Packet)]),
-            handle_request_state(Socket, PendingHttpRequest#{body := Packet}, State)
+            ExistingBody = maps:get(body, PendingHttpRequest, <<>>),
+            NewBody = <<ExistingBody/binary, Packet/binary>>,
+            CleanBufferMap = maps:remove(Socket, BufferMap),
+            CleanState = State#state{pending_buffer_map = CleanBufferMap},
+            handle_request_state(Socket, PendingHttpRequest#{body := NewBody}, CleanState)
     end.
 
 %% @private
@@ -213,7 +233,7 @@ handle_request_state(Socket, HttpRequest, State) ->
             {reply, Reply, State#state{pending_request_map = NewPendingRequestMap}};
         wait_for_body ->
             NewPendingRequestMap = PendingRequestMap#{Socket => HttpRequest},
-            call_http_req_handler(Socket, HttpRequest, State#state{pending_request_map = NewPendingRequestMap})
+            {noreply, State#state{pending_request_map = NewPendingRequestMap}}
     end.
 
 %% @private
@@ -290,13 +310,19 @@ update_state(Socket, HttpRequest, HandlerState, State) ->
 
 %% @hidden
 handle_tcp_closed(Socket, State) ->
-    case maps:get(Socket, State#state.ws_socket_map, undefined) of
+    NewPendingRequestMap = maps:remove(Socket, State#state.pending_request_map),
+    NewPendingBufferMap = maps:remove(Socket, State#state.pending_buffer_map),
+    CleanState = State#state{
+        pending_request_map = NewPendingRequestMap,
+        pending_buffer_map = NewPendingBufferMap
+    },
+    case maps:get(Socket, CleanState#state.ws_socket_map, undefined) of
         undefined ->
-            State;
+            CleanState;
         WebSocket ->
             ok = httpd_ws_handler:stop(WebSocket),
-            NewWebSocketMap = maps:remove(Socket, State#state.ws_socket_map),
-            State#state{ws_socket_map = NewWebSocketMap}
+            NewWebSocketMap = maps:remove(Socket, CleanState#state.ws_socket_map),
+            CleanState#state{ws_socket_map = NewWebSocketMap}
     end.
 
 %%
@@ -323,6 +349,29 @@ parse_http_request(Packet) ->
             body => erlang:list_to_binary(Body)
         }
     ).
+
+maybe_parse_http_request(Packet) when is_binary(Packet) ->
+    case find_header_delimiter(Packet) of
+        nomatch ->
+            {more, Packet};
+        {_Pos, _Len} ->
+            try
+                {ok, parse_http_request(binary_to_list(Packet))}
+            catch
+                throw:Reason ->
+                    {error, Reason};
+                error:Reason ->
+                    {error, Reason}
+            end
+    end.
+
+find_header_delimiter(Packet) ->
+    case binary:match(Packet, <<"\r\n\r\n">>) of
+        nomatch ->
+            binary:match(Packet, <<"\n\n">>);
+        Match ->
+            Match
+    end.
 
 %% @private
 parse_heading([$\s|Rest], start, Tmp, Accum) ->
