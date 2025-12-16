@@ -180,12 +180,10 @@ handle_http_request(Socket, Packet, State) ->
                                             {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
                                     end;
                                 Error ->
-                                    Error
+                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
                             end
                     end;
                 {error, Reason} ->
-                    CleanBufferMap = maps:remove(Socket, BufferMap),
-                    _CleanState = State#state{pending_buffer_map = CleanBufferMap},
                     {close, create_error(?BAD_REQUEST, Reason)}
             end;
         PendingHttpRequest ->
@@ -575,7 +573,7 @@ create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
     [
         <<"HTTP/1.1 ">>, erlang:integer_to_binary(StatusCode), <<" ">>, moniker(StatusCode),
         <<"\r\n">>,
-        io_lib:format("Server: atomvm-~s\r\n", [get_version_str(get_atomvm_version())]),
+        io_lib:format("Server: atomvm-~s\r\n", [get_version_str(erlang:system_info(atomvm_version))]),
         to_headers_list(HeadersWithLen),
         <<"\r\n">>,
         Reply
@@ -608,10 +606,8 @@ iolist_length(Bin) when is_binary(Bin) ->
     erlang:byte_size(Bin);
 iolist_length(Int) when is_integer(Int), Int >= 0, Int =< 255 ->
     1;
-iolist_length([]) ->
-    0;
-iolist_length([H | T]) ->
-    iolist_length(H) + iolist_length(T).
+iolist_length(List) when is_list(List)  ->
+    erlang:length(List).
 
 %% @private
 to_headers_list(Headers) ->
@@ -623,14 +619,6 @@ get_version_str(Version) when is_binary(Version) ->
     binary_to_list(Version);
 get_version_str(_) ->
     "unknown".
-
-get_atomvm_version() ->
-    case catch erlang:system_info(atomvm_version) of
-        {'EXIT', _} ->
-            undefined;
-        Version ->
-            Version
-    end.
 
 %% @private
 moniker(?OK) ->
