@@ -180,10 +180,12 @@ handle_http_request(Socket, Packet, State) ->
                                             {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
                                     end;
                                 Error ->
-                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                                    Error
                             end
                     end;
                 {error, Reason} ->
+                    CleanBufferMap = maps:remove(Socket, BufferMap),
+                    _CleanState = State#state{pending_buffer_map = CleanBufferMap},
                     {close, create_error(?BAD_REQUEST, Reason)}
             end;
         PendingHttpRequest ->
@@ -302,7 +304,7 @@ call_http_req_handler(Socket, HttpRequest, State) ->
 update_state(Socket, HttpRequest, HandlerState, State) ->
     NewHttpRequest = HttpRequest#{handler_state := HandlerState},
     PendingRequestMap = State#state.pending_request_map,
-    NewPendingRequestMap = PendingRequestMap#{Socket := NewHttpRequest},
+    NewPendingRequestMap = PendingRequestMap#{Socket => NewHttpRequest},
     State#state{pending_request_map = NewPendingRequestMap}.
 
 
